@@ -1,0 +1,20 @@
+{
+  "name": "Inventory only; no performance targets supplied",
+  "gpu_count": null,
+  "gpu_name_contains": null,
+  "gpu_memory_mib_min": null,
+  "gpu_power_limit_w_min": null,
+  "gpu_pcie_width_min": null,
+  "gpu_pcie_speed_gt_min": null,
+  "gpu_h2d_mb_s_min": null,
+  "gpu_d2h_mb_s_min": null,
+  "cpu_logical_min": null,
+  "cpu_events_s_min": null,
+  "ram_gib_min": null,
+  "ram_populated_dimms_min": null,
+  "ram_configured_mhz_min": null,
+  "ram_write_mib_s_min": null,
+  "disk_read_mib_s_min": null,
+  "disk_write_mib_s_min": null,
+  "disk_randread_iops_min": null
+}

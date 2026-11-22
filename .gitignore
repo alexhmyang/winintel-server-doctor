@@ -1,0 +1,9 @@
+reports/
+__pycache__/
+*.pyc
+*.o
+*.fatbin
+vendor/gpu-burn/gpu_burn
+bin/
+.venv/
+*.log
