@@ -7,11 +7,12 @@ Author: 数萌AI服务器 (winintel) | winintel.com
 | Area | Tool / measurement | What a pass proves |
 |---|---|---|
 | GPU inventory | nvidia-smi | Driver query works; count/model/VRAM meet the supplied order |
-| GPU correctness | gpu-burn | Each GPU reports OK after the requested workload duration |
-| GPU memory errors | ECC before and after burn | No reported uncorrectable volatile ECC |
+| GPU correctness | gpu-burn FP32 and FP64, matrixMul, simpleCUBLAS_LU | Completed per-GPU arithmetic comparisons and independent reference validation |
+| GPU VRAM | cuda_memtest 0–8, 10; optional 9 | Completed requested pattern passes on the reported allocation |
+| GPU ECC | NVIDIA XML before and after all GPU tests | Supported volatile/aggregate memory/register/cache counters and retirement state checked |
 | GPU operating state | nvidia-smi CSV every second | Power/utilization/SM-clock evidence; power limits are never changed |
 | PCIe | sysfs + bandwidthTest | Negotiated lane count/rate and achieved pinned host transfer speed |
-| Multi-GPU | topo -m + p2pBandwidthLatencyTest | Peer transfer matrices produced successfully; not an NVLink universal score |
+| Multi-GPU | topo -m + parsed CUDA P2P matrices | Measured NVLink-connected pairs in both directions; non-P2P fallback is not accepted as NVLink speed |
 | CPU | stress-ng --verify + sysbench prime=20000 | Verification workload completed and configured events/s target met |
 | RAM correctness | stress-ng VM --verify, 25% available memory | Verification workload passed for the tested allocation/time |
 | RAM write | sysbench, 64MiB, one thread | Repeatable workload metric; not full memory-channel bandwidth |
@@ -20,7 +21,11 @@ Author: 数萌AI服务器 (winintel) | winintel.com
 
 CUDA Samples describe their results as illustrative and variable with GPU Boost. We use them as transparent diagnostic baselines, not certified hardware benchmark rankings.
 
-Default burn-in is 60 seconds per tool. Increase to `--seconds 300` or longer for sustained acceptance. A short pass does not establish long-term hardware reliability. No model is downloaded or inference benchmark implied.
+Default burn-in is 60 seconds per arithmetic stress tool. Increase to `--seconds 300` or longer for sustained acceptance. VRAM pattern suites have their own `--vram-passes` and `--vram-timeout`, defaulting to one pass and 1800 seconds per GPU. `--seconds` does not truncate the VRAM patterns. A short pass does not establish long-term hardware reliability. No model is downloaded or inference benchmark implied.
+
+Use `--vram-passes 32` for the upstream test6 pattern rotation. `--bit-fade` adds test9, which sleeps and verifies two patterns over approximately three hours per pass and GPU. The CLI requires `--vram-timeout` at least `10800 * passes + 1800`. All required per-test completion markers and the normal exit marker are checked. Allocation coverage uses allocated MiB / reported driver-visible capacity; compare it to `gpu_vram_coverage_pct_min` (for example, 90). Driver-reserved memory cannot be tested.
+
+ECC counters are matched by UUID across snapshots. Positive corrected/uncorrected changes fail acceptance; missing baselines and counter resets are UNKNOWN. Existing uncorrectable/retired/remapped evidence also fails. Unsupported locations are retained in inventory without pretending they are error-free. Arithmetic correctness and ECC are complementary tests.
 
 ## Profiles
 
@@ -32,7 +37,7 @@ An idle PCIe link may read Gen1 even after a short transfer. A link-rate failure
 
 ## Memory channels
 
-Inventory records populated DIMM sizes, bank/slot locators and configured speed. It omits DIMM serial numbers. DMI does not provide a universal reliable channel map, so the report defaults to UNKNOWN.
+Inventory records populated DIMM sizes, manufacturers, part numbers, bank/slot locators and configured speed. `--include-serials` includes private component serials for customer support. DMI does not provide a universal reliable channel map, so the report defaults to UNKNOWN.
 
 If the manufacturer's documentation confirms locators such as `CPU1_CH0_DIMM0`, a profile can supply:
 
@@ -52,7 +57,7 @@ The capture groups identify the CPU and channel. Two DIMMs in the same CPU/chann
 
 The default scratch size is 4 GiB. Preparation writes and verifies the entire file; three timed measurements reuse it. Preparation is capped at 600 seconds. Unsupported direct I/O, missing tools and timeouts are reported. Increase `--disk-size-gib` for larger working sets; results may still reflect a controller cache.
 
-This first release does not certify SMART lifetime health, CPU PPIN, disk/GPU serial tracking, full RAM capacity, all PCIe peripherals, IB fabric throughput or AI model performance. These require separate checks and baselines.
+SMART, PCIe peripherals, USB, network and optional BMC evidence are collected; unsupported controllers and missing permissions remain UNKNOWN. Inventory is not a full electrical test of every peripheral, SSD remaining-life certification, CPU PPIN capture, full RAM allocation test, IB throughput test or AI model evaluation.
 
 ## Report states
 
@@ -60,4 +65,4 @@ PASS means an emitted check passed. FAIL takes precedence over UNKNOWN. Otherwis
 
 Missing thresholds, missing tools, skipped categories, a duration that ends too early, timeout and interruption never become a pass. GPU burn output is checked per GPU because a zero gpu-burn process exit code alone does not prove correctness.
 
-JSON contains the profile, inventory, checks, command arguments, timings and relative log paths. HTML needs no server or external assets. JSON/HTML/Markdown and logs are private by default (`umask 077`); they can include topology, process IDs and filesystem paths. Inspect before publishing.
+JSON contains the profile, inventory, checks, command arguments, timings and relative log paths. HTML displays GPU/DIMM/disk tables and full collected inventory; Markdown retains inventory too. HTML needs no server or external assets. JSON/HTML/Markdown and logs are private by default (`umask 077`); raw diagnostic logs may contain identifiers even without `--include-serials`. Inspect before publishing.

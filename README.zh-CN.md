@@ -8,18 +8,22 @@
 |---|---|
 | 🟢 驱动安装 | Ubuntu 仓库中最新的 V100 兼容 R580-server 专有驱动补丁 |
 | 🧰 CUDA | 12.8 / 11.6 / 13.0 按需安装、并存、切换 |
-| 🔥 GPU 压测 | gpu-burn 校验计算结果，逐卡判断，检查 ECC，记录功耗/利用率 |
+| 🔥 核心压测 | gpu-burn 单精度 FP32、双精度 FP64；NVIDIA 矩阵计算和双精度 LU 分解校验 |
+| 🧠 显存检测 | cuda_memtest 地址/位模式/随机数据/搬移测试，记录实际显存覆盖率 |
+| 🛡️ ECC | 显存、寄存器、L1/L2 等硬件支持的位置，记录测试前后单比特/双比特变化 |
 | ⚙️ CPU、内存 | stress-ng 校验 + sysbench 测速 |
 | 💾 硬盘 | fio CRC32C 校验、顺序读写、4K 随机读取 IOPS |
-| 🔌 PCIe | 速率、通道宽度、CPU↔GPU 传输速度、多卡 P2P 带宽与延迟 |
+| 🔌 PCIe、NVLink | PCIe 传输；按真实 NVLink 拓扑逐对测双向带宽、记录链路错误 |
+| 🖥️ 配件清单 | CPU、主板、BIOS、GPU、内存、磁盘、电源、网络、PCIe、USB、SMART/BMC |
+| 🛎️ 长期监控 | 每 30 分钟检查重启、ECC、内核、内存和磁盘异常；可配置远程报警接收地址 |
 | 📊 验收报告 | HTML 给客户看，JSON 给 AI Agent，Markdown 方便存档 |
 
 ## 三步开始
 
-下载并解压 [发行包](https://github.com/alexhmyang/winintel-server-doctor/releases/tag/v0.1.0)，进入目录后运行：
+下载并解压 [发行包](https://github.com/alexhmyang/winintel-server-doctor/releases/latest)，进入目录后运行：
 
 ```bash
-sudo bash install.sh
+sudo bash install.sh --monitor
 ```
 
 在维护窗口重启，再确认：
@@ -33,13 +37,17 @@ winintel-doctor inventory
 
 ```bash
 sudo winintel-doctor test \
-  --profile /opt/winintel-server-doctor/profiles/v100-sxm2-8gpu.json \
-  --disk-path /var/tmp --seconds 60
+  --profile /opt/winintel-server-doctor/profiles/v100-auto.json \
+  --disk-path /var/tmp --seconds 60 --include-serials
 ```
 
 打开生成的 `reports/时间/report.html`，即可查看验收结果。报告不会自动上传。
 
-安装大约 10–30 分钟，受网络、缓存和内核编译影响；默认完整验收约 8–15 分钟。压测会占用服务器资源，请安排维护窗口。
+安装大约 10–30 分钟，受网络、缓存和内核编译影响。显存测试逐卡运行，耗时取决于容量与遍数，默认每卡上限 30 分钟；先用 `--dry-run` 查看计划。压测会占用服务器资源，请安排维护窗口。
+
+**不限定 8 卡。** 自动遍历实际显卡数量，单卡跳过卡间测试；PCIe/SXM2/SXM3 等按真实 SKU 记录，未知板型不会猜测。`v100-auto.json` 是通用起点，显卡数量、显存容量和 NVLink 门槛要按客户订单补充。
+
+深度显存检测可设置 `--vram-passes 32 --vram-timeout 86400`；加 `--bit-fade` 开启每卡每遍约 3 小时的显存保持测试，必须相应增加超时。报告写出实际分配量，不声称测到了驱动保留显存。更多 NVIDIA 系列的适配与实测状态见 [覆盖说明](docs/GPU-COVERAGE.md)。
 
 ## V100 要选对版本
 
@@ -81,6 +89,14 @@ CPU 核心数、内存容量/插条数/配置速率、硬盘速度应按客户�
 先读 [AGENTS.md](AGENTS.md)，执行 `--dry-run` 获取计划。实际运行结束后读取 stdout 最后一行 JSON，再读取 `report.json`，根据退出码继续处理。不要把安装后尚未重启、未运行验收的服务器标为交付合格。
 
 首版实际验证范围见 [VALIDATION.md](docs/VALIDATION.md)。文档中的配置数值是示例门槛，不是伪造的硬件实测成绩。
+
+## 每半小时监控
+
+安装加 `--monitor` 即启用监控。已经装好驱动的服务器可单独运行 `sudo bash install-monitor.sh`，不重装驱动、不启动压测。每小时 00、30 分检查，安装后立即采集一次，重启后计时器仍有效。
+
+本地异常记录在 `/var/lib/winintel-server-doctor/alerts.jsonl`。把团队授权的 HTTPS JSON 接收地址填入 `/etc/winintel-server-doctor/monitor.json` 才会发送外部报警，发送失败会保留待发队列。程序不会假定收件人。详见 [监控配置](docs/MONITORING.md)。
+
+重启能被发现，但原因需要日志和 BMC 证据；巡检报警通常在下一次检查产生，最长约 30 分钟加采集时间。机器断电或断网期间，必须由外部心跳接收服务判断离线。报告不可把“已装监控”写成“已证明永不重启”。
 
 ⭐ 欢迎 Star、分享客户验收配置、提交兼容性反馈，让更多 V100 服务器继续发挥价值。
 

@@ -7,6 +7,7 @@ CUDA_VERSIONS=12.8
 DRIVER=1
 TOOLS=1
 ALLOW13=0
+MONITOR=0
 DRY_RUN=0
 PREFIX=/opt/winintel-server-doctor
 CACHE=/var/cache/winintel-server-doctor
@@ -19,6 +20,7 @@ winintel AI Server Doctor installer (Ubuntu 22.04/24.04 x86_64)
   --cuda 12.8|11.6|13.0|all|none   Comma-separated versions; default 12.8
   --skip-driver                    Keep the installed driver
   --skip-tools                     Do not build benchmark programs
+  --monitor                        Install persistent 30-minute monitoring
   --allow-unsupported-cuda13        Install toolkit only on V100; keep 12.8 default
   --prefix /absolute/path          Default /opt/winintel-server-doctor
   --dry-run                        Print plan without downloading/changing anything
@@ -38,6 +40,7 @@ while (( $# )); do
         --cuda) [[ $# -ge 2 ]] || die "Missing CUDA version"; CUDA_VERSIONS=$2; shift 2 ;;
         --skip-driver) DRIVER=0; shift ;;
         --skip-tools) TOOLS=0; shift ;;
+        --monitor) MONITOR=1; shift ;;
         --allow-unsupported-cuda13) ALLOW13=1; shift ;;
         --prefix) [[ $# -ge 2 ]] || die "Missing prefix"; PREFIX=$2; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -117,7 +120,8 @@ APT=(apt-get -o "Dir::Etc::sourcelist=$APT_SOURCE" -o "Dir::Etc::sourceparts=-"
     -o Acquire::Retries=3 -o APT::Update::Error-Mode=any)
 run "${APT[@]}" update
 PACKAGES=(ca-certificates curl build-essential pciutils dmidecode smartmontools
-    nvme-cli stress-ng sysbench fio numactl mokutil python3 python3-venv)
+    nvme-cli stress-ng sysbench fio numactl mokutil python3 python3-venv
+    ipmitool usbutils)
 if (( DRIVER )); then PACKAGES+=("linux-headers-$(uname -r)" nvidia-driver-580-server); fi
 if [[ ",$CUDA_VERSIONS," = *,11.6,* ]]; then PACKAGES+=(gcc-10 g++-10); fi
 if (( DRIVER )); then
@@ -171,13 +175,14 @@ if (( ! HAS12 )); then DEFAULT="${VERSIONS[0]}"; fi
 if [[ "$DEFAULT" != none ]]; then
     printf '%s\n' "$DEFAULT" > "$PREFIX/default-cuda"
 fi
-run cp -a "$ROOT/doctor.py" "$ROOT/profiles" "$ROOT/vendor" "$ROOT/cuda-env.sh" "$ROOT/winintel-doctor" "$PREFIX/"
+run cp -a "$ROOT/doctor.py" "$ROOT/hardware.py" "$ROOT/monitor.py" "$ROOT/install-monitor.sh" "$ROOT/install-runtime.sh" "$ROOT/profiles" "$ROOT/vendor" "$ROOT/cuda-env.sh" "$ROOT/winintel-doctor" "$PREFIX/"
+run bash "$PREFIX/install-runtime.sh" "$PREFIX"
 run chmod 755 "$PREFIX/winintel-doctor"
 if (( TOOLS )); then
     [[ -x /usr/local/cuda-12.8/bin/nvcc ]] || die "Tool builds require CUDA 12.8; install it or use --skip-tools"
     run make -C "$PREFIX/vendor/gpu-burn" -j"$(nproc)" COMPUTE=70 CUDAPATH=/usr/local/cuda-12.8
     install -d "$PREFIX/bin"
-    for tool in deviceQuery bandwidthTest p2pBandwidthLatencyTest; do
+    for tool in deviceQuery bandwidthTest p2pBandwidthLatencyTest matrixMul; do
         source_file="$PREFIX/vendor/cuda-samples/$tool/$tool.cu"
         if [[ "$tool" = deviceQuery ]]; then
             source_file="$PREFIX/vendor/cuda-samples/$tool/$tool.cpp"
@@ -186,7 +191,16 @@ if (( TOOLS )); then
             -I "$PREFIX/vendor/cuda-samples/Common" \
             "$source_file" -o "$PREFIX/bin/$tool"
     done
+    run /usr/local/cuda-12.8/bin/nvcc -O3 -std=c++17 -arch=sm_70 \
+        -I "$PREFIX/vendor/cuda-samples/Common" \
+        "$PREFIX/vendor/cuda-samples/simpleCUBLAS_LU/simpleCUBLAS_LU.cpp" \
+        -lcublas -o "$PREFIX/bin/simpleCUBLAS_LU"
+    run /usr/local/cuda-12.8/bin/nvcc -O3 -std=c++17 -arch=sm_70 \
+        -DENABLE_NVML=0 -x cu "$PREFIX/vendor/cuda_memtest/cuda_memtest.cpp" \
+        "$PREFIX/vendor/cuda_memtest/tests.cpp" "$PREFIX/vendor/cuda_memtest/misc.cpp" \
+        -Xcompiler -pthread -o "$PREFIX/bin/cuda_memtest"
 fi
+if (( MONITOR )); then run bash "$PREFIX/install-monitor.sh" "$PREFIX"; fi
 ln -sfn "$PREFIX/winintel-doctor" /usr/local/bin/winintel-doctor
 printf 'Installation complete. Log: %s\n' "$LOG"
 printf 'Next: reboot in your maintenance window, then run nvidia-smi and winintel-doctor inventory.\n'

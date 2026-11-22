@@ -1,10 +1,20 @@
-# v0.1.0 validation
+# Release validation
 
 Author: 数萌AI服务器 (winintel) | winintel.com
 
 Validation date: **2026-11-22**.
 
-## Checks performed
+## v0.2.0 expanded checks
+
+- **17 behavioral tests passed** under Linux/uv, including GPU UUID reordering, actual NVLink-pair selection, reboot/ECC/unknown-kernel detection and preserving failed webhook deliveries for retry.
+- **Ruff, Bash syntax and ShellCheck passed** for the expanded source and installers.
+- **All seven GPU executables built successfully** on native Ubuntu 22.04 with SM70 and CUDA 12.8.93: gpu-burn, deviceQuery, bandwidthTest, p2pBandwidthLatencyTest, matrixMul, double-precision simpleCUBLAS_LU and cuda_memtest. A compact NVIDIA China redistribution toolkit and the host's existing cuBLAS libraries were used for this build validation; this was not a clean full-toolkit installation.
+- **Persistent systemd monitoring installed and executed** on the native 8×V100 server. Timer activation and service `Result=success`, `ExecMainStatus=0` were verified; the half-hour scheduled invocation also occurred. No real reboot was forced. Reboot detection and delivery retry were validated with simulated state transitions, without sending a production external alert.
+- **Native detailed inventory captured** with component serials for private support reporting. Available GPU memory/register/L1/L2 volatile/aggregate ECC counters were zero at the observed snapshots. Unsupported counters remain recorded as N/A. A zero snapshot is not a burn-in result.
+
+GPU burn-in, VRAM patterns, arithmetic reference execution and NVLink bandwidth **have not run on this busy V100 host**. Its existing eight GPU workloads were preserved. Tool build success and parser tests must not be represented as measured hardware acceptance. New NVIDIA family coverage and clean driver/CUDA installation remain unvalidated.
+
+## v0.1.0 checks performed
 
 - **13 behavioral tests passed**, including unavailable readings, missing thresholds, faulty GPU output with zero process exit, timeout, customer-file preservation, HTML escaping, and vendor-mapped memory channels.
 - **Bash syntax checks and ShellCheck passed** for the installer, environment selector and CLI launcher.
@@ -17,7 +27,7 @@ Validation date: **2026-11-22**.
 
 ## Practical limits
 
-This release has **not** completed an end-to-end clean NVIDIA-driver/CUDA installation, a local build of all GPU tools, or a new V100 burn-in run. The native V100 host had active GPU workloads, so validation there was limited to read-only inventory and installation planning.
+The original v0.1.0 validation did **not** include GPU tool builds. v0.2.0 adds successful native SM70 builds, but still has **not** completed an end-to-end clean NVIDIA-driver/CUDA installation or a new V100 burn-in run. The native V100 host had active GPU workloads.
 
 The WSL smoke run verifies the orchestration and safe scratch-file path; its speed results are not a V100 server baseline and are not advertised as customer acceptance scores.
 

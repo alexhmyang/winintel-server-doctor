@@ -15,21 +15,24 @@ Give customers and their AI Agents one consistent workflow to install a V100-com
 |---|---|
 | 🟢 V100 driver setup | Latest proprietary **R580-server patch available in Ubuntu APT**, with signed Ubuntu packages |
 | 🧰 CUDA selection | **12.8.1**, **11.6.2**, and **13.0.2** toolkit-only installers; side-by-side environments |
-| 🔥 GPU burn-in | Vendored **gpu-burn**, compiled for **SM70**, computed-result checks per GPU, ECC checks, power/utilization CSV |
+| 🔥 GPU core checks | **gpu-burn FP32 + FP64**, NVIDIA matrix multiplication and double-precision LU reference validation |
+| 🧠 VRAM & ECC | **cuda_memtest** address/bit/random/block patterns, measured allocation coverage; memory/register/L1/L2 ECC where supported |
 | ⚙️ CPU & RAM | **stress-ng** verification and **sysbench** repeatable measurements |
 | 💾 Storage | **fio** CRC32C verification, sequential read/write and 4K random-read IOPS on a unique scratch file |
-| 🔌 PCIe & interconnect | Negotiated lane count/speed, pinned-memory H2D/D2H transfers, CUDA P2P bandwidth/latency matrices |
+| 🔌 PCIe & NVLink | H2D/D2H, CUDA P2P matrices, per-direction bandwidth for actual NVLink-connected pairs and link-error counters |
+| 🖥️ Components | GPU/DIMM/disk tables, CPU, board, BIOS, PSU, PCIe, USB, network, SMART and optional BMC evidence |
+| 🛎️ Monitoring | Persistent **30-minute systemd timer**, reboot/GPU/ECC/EDAC/kernel/SMART alerts; optional HTTPS receiver with retries |
 | 📊 Reports | Standalone **HTML + JSON + Markdown**, with per-check PASS / FAIL / UNKNOWN and evidence logs |
 | 🤖 Agent workflow | Dry-run plans, explicit arguments, configurable thresholds, stable exit codes, [AGENTS.md](AGENTS.md) |
 | 🇨🇳 China-first downloads | Tsinghua Ubuntu mirror + NVIDIA China toolkit downloads; vendored GPU sources require no build-time GitHub fetch |
 
 ## Start here
 
-Download and extract the [v0.1.0 release bundle](https://github.com/alexhmyang/winintel-server-doctor/releases/tag/v0.1.0), or clone this repository. For China networks, distribute the same checksum-verified bundle through your company's domestic download service.
+Download and extract the [release bundle](https://github.com/alexhmyang/winintel-server-doctor/releases/latest), or clone this repository. For China networks, distribute the same checksum-verified bundle through your company's domestic download service.
 
 ```bash
 cd winintel-server-doctor
-sudo bash install.sh
+sudo bash install.sh --monitor
 ```
 
 Restart during your maintenance window, then:
@@ -38,13 +41,17 @@ Restart during your maintenance window, then:
 nvidia-smi
 winintel-doctor inventory
 sudo winintel-doctor test \
-  --profile /opt/winintel-server-doctor/profiles/v100-sxm2-8gpu.json \
-  --disk-path /var/tmp --seconds 60
+  --profile /opt/winintel-server-doctor/profiles/v100-auto.json \
+  --disk-path /var/tmp --seconds 60 --include-serials
 ```
 
 Open the generated `reports/<timestamp>/report.html`. Give `report.json` to your AI Agent. Reports stay on your machine; nothing is uploaded automatically.
 
-**Default installation: R580-server + CUDA 12.8 + all test tools.** Download size is several GB; allow roughly 10–30 minutes for setup depending on bandwidth, kernel compilation, and cached files. A 60-second acceptance run typically takes 8–15 minutes. Run during maintenance: tests consume GPU, CPU, RAM and storage resources.
+**Default installation: R580-server + CUDA 12.8 + all test tools.** Download size is several GB; allow roughly 10–30 minutes for setup depending on bandwidth, kernel compilation, and cached files. VRAM tests run sequentially per detected GPU and add variable time; the default timeout is 30 minutes per GPU. The CLI prints a dry-run plan. Run during maintenance: tests consume GPU, CPU, RAM and storage resources.
+
+No eight-card assumption is built into the test runner. One-card systems skip GPU-to-GPU transfer tests. PCIe/SXM board names come from the reported SKU; unknown names stay UNKNOWN. Set the expected count, capacity and speed floors from the customer's order. `v100-auto.json` accepts 16/32 GiB V100 variants as a starting point and leaves unspecified order thresholds UNKNOWN.
+
+For deeper VRAM coverage, use `--vram-passes 32 --vram-timeout 86400`. Add `--bit-fade` for the upstream three-hour retention test **per pass and GPU**; the CLI requires sufficient timeout. Tested VRAM coverage is reported as a percentage of driver-visible capacity, not an assertion that reserved memory was accessible. See [GPU family coverage](docs/GPU-COVERAGE.md).
 
 ## V100 compatibility comes first
 
@@ -103,6 +110,17 @@ winintel-doctor test --profile customer.json --dry-run
 sudo winintel-doctor test --profile customer.json --seconds 300 \
   --disk-path /mnt/customer-nvme --output /var/tmp/customer-acceptance
 ```
+
+## Persistent customer monitoring
+
+`--monitor` installs the service, runs an initial snapshot and enables checks at minute 00 and 30. For an existing server without reinstalling the driver or CUDA:
+
+```bash
+sudo bash install-monitor.sh
+systemctl status winintel-server-monitor.timer
+```
+
+Local state and alerts stay in `/var/lib/winintel-server-doctor/`. Configure an authorized HTTPS JSON receiver in `/etc/winintel-server-doctor/monitor.json` to forward anomalies to your support team. No recipient or token is bundled. A reboot is detected by a changed boot ID; its cause still requires BMC and system logs. A powered-off server needs an external heartbeat receiver to detect missing checks. [Monitoring guide](docs/MONITORING.md) explains delivery, retention and limitations.
 
 | Exit code | Meaning |
 |---|---|

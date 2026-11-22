@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("doctor", ROOT / "doctor.py")
 doctor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(doctor)
@@ -169,7 +170,14 @@ Transfer Size (Bytes) Bandwidth(MB/s)
             "gpu-0-bandwidth": "Result = PASS",
             "gpu-ecc-before": "0, 0",
             "gpu-ecc-after": "0, 0",
-            "gpu-burn": "GPU 0: FAULTY",
+            "gpu-burn-fp32": "GPU 0: FAULTY",
+            "gpu-burn-fp64": "GPU 0: OK",
+            "gpu-0-vram": "main thread: Program exits",
+            "gpu-0-matrix-reference": "Result = PASS",
+            "gpu-0-fp64-lu-reference": "TEST SUCCESSFUL",
+            "nvlink-after-s": "",
+            "nvlink-after-e": "",
+            "nvlink-errors-before": "",
         }
 
         def fake_command(name, argv, **kwargs):
@@ -180,8 +188,86 @@ Transfer Size (Bytes) Bandwidth(MB/s)
             doctor, "pcie", return_value={},
         ), patch.object(doctor.subprocess, "Popen", return_value=monitor):
             doctor.gpu_tests(report, argparse.Namespace(seconds=10))
-        check = next(x for x in report.data["checks"] if x["name"] == "GPU 0 stress correctness")
+        check = next(x for x in report.data["checks"] if x["name"] == "GPU 0 FP32 stress correctness")
         self.assertEqual(check["status"], "FAIL")
+
+    def test_nvlink_speed_is_measured_only_on_connected_pairs(self):
+        from hardware import matrices, nvlink_pairs
+
+        topo = "        GPU0 GPU1 GPU2\nGPU0 X NV2 SYS\nGPU1 NV2 X SYS\nGPU2 SYS SYS X\n"
+        text = """P2P Connectivity Matrix
+ D\\D 0 1 2
+ 0 1 1 0
+ 1 1 1 0
+ 2 0 0 1
+Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)
+ D\\D 0 1 2
+ 0 800 43.2 8.1
+ 1 42.8 800 8.0
+ 2 8.1 8.0 800
+"""
+        self.assertEqual(nvlink_pairs(topo), [("0", "1")])
+        parsed = matrices(text)
+        self.assertEqual(parsed["P2P Connectivity Matrix"]["0"]["2"], 0)
+        self.assertEqual(parsed["Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)"]["0"]["1"], 43.2)
+
+    def test_ecc_comparison_tracks_uuid_after_gpu_reordering(self):
+        from hardware import counter_changes, gpu_details
+
+        def xml(uuid, value):
+            return f"""<nvidia_smi_log><gpu><uuid>{uuid}</uuid>
+<product_name>Tesla V100-SXM2-32GB</product_name>
+<ecc_errors><volatile><single_bit><device_memory>{value}</device_memory>
+</single_bit></volatile></ecc_errors></gpu></nvidia_smi_log>"""
+
+        before = gpu_details(xml("GPU-a", 2))
+        after = {"1": gpu_details(xml("GPU-a", 3))["0"]}
+        change = counter_changes(before, after)[0]
+        self.assertEqual(change["delta"], 1)
+        self.assertEqual(change["gpu"], "1")
+        self.assertEqual(after["1"]["form_factor"], "SXM2")
+
+    @unittest.skipUnless(sys.platform == "linux", "Monitor requires Linux")
+    def test_monitor_detects_reboot_ecc_and_unknown_kernel_errors(self):
+        import monitor
+
+        base = {
+            "boot_id": "a", "gpu_query_code": 0, "journal_code": 0,
+            "gpus": {"0": {"uuid": "GPU-a", "error_counters": {
+                "ecc_errors/volatile/single_bit/device_memory": "0",
+            }}},
+            "kernel_records": [], "edac": {}, "storage": {},
+            "nvlink": {"output": ""}, "failed_services": {"returncode": 0, "output": ""},
+        }
+        current = json.loads(json.dumps(base))
+        current["boot_id"] = "b"
+        current["gpus"]["0"]["error_counters"]["ecc_errors/volatile/single_bit/device_memory"] = "1"
+        current["kernel_records"] = [{"MESSAGE": "unknown platform error", "PRIORITY": "3"}]
+        kinds = {event["kind"] for event in monitor.anomalies(base, current)}
+        self.assertEqual(kinds, {"REBOOT_DETECTED", "GPU_COUNTER_CHANGED", "KERNEL_WARNING_OR_ERROR"})
+
+    @unittest.skipUnless(sys.platform == "linux", "Monitor requires Linux")
+    def test_delivery_failure_keeps_pending_alert_for_retry(self):
+        import monitor
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            config = path / "config.json"
+            config.write_text('{"webhook_url":"https://example.invalid/receiver"}')
+            current = {
+                "host": "test", "time": "2026-11-22T00:00:00+00:00",
+                "boot_id": "a", "gpu_query_code": 1, "journal_code": 0,
+                "gpus": {}, "kernel_records": [], "edac": {}, "storage": {},
+                "nvlink": {"output": ""}, "failed_services": {"returncode": 0, "output": ""},
+            }
+            argv = ["monitor", "--state-dir", folder, "--config", str(config)]
+            with patch.object(sys, "argv", argv), patch.object(monitor, "snapshot", return_value=current), patch.object(
+                monitor, "deliver", side_effect=OSError("offline"),
+            ):
+                monitor.main()
+            pending = json.loads((path / "pending.json").read_text())
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["events"][0]["kind"], "COLLECTION_FAILED")
 
 
 if __name__ == "__main__":

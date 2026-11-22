@@ -1,0 +1,12 @@
+{
+  "name": "V100 PCIe/SXM; arbitrary count. Set order-specific count and capacity.",
+  "gpu_name_contains": "V100",
+  "gpu_count": null,
+  "gpu_memory_mib_min": 15000,
+  "gpu_pcie_width_min": 16,
+  "gpu_pcie_speed_gt_min": 8,
+  "gpu_h2d_mb_s_min": 10000,
+  "gpu_d2h_mb_s_min": 10000,
+  "gpu_nvlink_gb_s_min": null,
+  "gpu_vram_coverage_pct_min": 90
+}

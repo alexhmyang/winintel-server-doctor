@@ -2,5 +2,4 @@
 # Author: 数萌AI服务器 (winintel) | winintel.com
 set -euo pipefail
 ROOT="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
-# Ubuntu's Python is used only for this dependency-free hardware orchestration CLI.
-exec /usr/bin/python3 "$ROOT/doctor.py" "$@"
+exec "$ROOT/uv" run --offline --no-project --python "$ROOT/.venv/bin/python" "$ROOT/doctor.py" "$@"

@@ -21,7 +21,9 @@ CUDA uses fixed patch-version NVIDIA China `.run` archives with **only `--toolki
 
 The installed CLI is `/usr/local/bin/winintel-doctor`; its files live under `/opt/winintel-server-doctor`. GPU tools are built locally for SM70 using CUDA 12.8. Their source is vendored with licenses.
 
-The CLI uses Ubuntu's standard-library Python 3.10+ runtime and does not require pip packages.
+The CLI uses an isolated uv-managed Python 3.10+ environment with standard-library code and no pip dependencies. An existing uv binary can be reused with `WININTEL_UV_BIN`; otherwise a pinned standalone uv archive is downloaded through `WININTEL_GITHUB_MIRROR` (default `https://ghfast.top`). No foreign-download fallback is used. Benchmark sources are already vendored.
+
+`sudo bash install.sh --monitor` adds the persistent half-hour monitor. Existing-driver servers can run `sudo bash install-monitor.sh` alone. See [MONITORING.md](MONITORING.md) to configure an authorized alert receiver.
 
 ## Select CUDA
 

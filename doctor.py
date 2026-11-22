@@ -18,8 +18,16 @@ import tempfile
 import time
 from pathlib import Path
 
+from hardware import (
+    counter_changes,
+    gpu_details,
+    matrices,
+    nvlink_counters,
+    nvlink_pairs,
+)
+
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 FIELDS = [
     "index", "name", "pci.bus_id", "memory.total", "power.limit",
     "power.max_limit", "driver_version", "ecc.errors.uncorrected.volatile.total",
@@ -32,6 +40,7 @@ TARGETS = {
     "ram_configured_mhz_min", "ram_write_mib_s_min",
     "disk_read_mib_s_min", "disk_write_mib_s_min", "disk_randread_iops_min",
     "ram_channels_min", "ram_channel_locator_regex",
+    "gpu_nvlink_gb_s_min", "gpu_vram_coverage_pct_min",
 }
 
 
@@ -95,7 +104,7 @@ def pcie(bus):
     return result
 
 
-def dimms(text):
+def dimms(text, include_serials=False):
     """Extract populated DIMM topology without recording serial numbers."""
     rows = []
     for block in text.split("Memory Device\n")[1:]:
@@ -112,11 +121,16 @@ def dimms(text):
             "bank": values.get("Bank Locator"),
             "configured_speed": values.get("Configured Memory Speed", values.get("Configured Clock Speed")),
             "rated_speed": values.get("Speed"),
+            "manufacturer": values.get("Manufacturer"),
+            "part_number": values.get("Part Number"),
+            "type": values.get("Type"),
+            "data_width": values.get("Data Width"),
+            **({"serial": values.get("Serial Number")} if include_serials else {}),
         })
     return rows
 
 
-def inventory():
+def inventory(include_serials=False):
     cpu = run_command(["lscpu", "-J"])
     try:
         cpu_data = json.loads(cpu["output"])
@@ -137,23 +151,100 @@ def inventory():
     total = re.search(r"MemTotal:\s+(\d+)", mem)
     available = re.search(r"MemAvailable:\s+(\d+)", mem)
     dmi = run_command(["dmidecode", "-t", "17"])
+    details_query = run_command(["nvidia-smi", "-q", "-x"])
+    details = gpu_details(details_query["output"])
+    for gpu in gpus:
+        extra = details.get(gpu["index"], {})
+        if not include_serials:
+            extra.pop("serial", None)
+        gpu["details"] = extra
     topo = run_command(["nvidia-smi", "topo", "-m"])
-    disks = run_command(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,MODEL,ROTA,TRAN"])
+    disk_fields = "NAME,TYPE,SIZE,MODEL,VENDOR,REV,ROTA,TRAN,MOUNTPOINTS"
+    if include_serials:
+        disk_fields += ",SERIAL,WWN"
+    disks = run_command(["lsblk", "-J", "-o", disk_fields])
     try:
         block_devices = json.loads(disks["output"])
     except ValueError:
         block_devices = {"error": disks["output"]}
-    return {
+    result = {
         "cpu": cpu_data, "cpu_logical": os.cpu_count(),
         "ram_gib": round(int(total[1]) / 1024**2, 2) if total else None,
         "available_ram_gib": round(int(available[1]) / 1024**2, 2) if available else None,
-        "dimms": dimms(dmi["output"]),
+        "dimms": dimms(dmi["output"], include_serials),
         "dimms_available": dmi["returncode"] == 0,
         "gpus": gpus, "gpu_query": smi, "gpu_topology": topo,
         "disks": block_devices,
+        "gpu_details_query": details_query,
+        "nvlink_status": run_command(["nvidia-smi", "nvlink", "-s"]),
+        "nvlink_error_counters": run_command(["nvidia-smi", "nvlink", "-e"]),
+        "pcie_all_devices": run_command(["lspci", "-Dnnvv"]),
+        "network": run_command(["ip", "-j", "-details", "link"]),
+        "usb": run_command(["lsusb"]),
+        "system_board_bios_cpu_psu": run_command([
+            "dmidecode", "-t", "0,1,2,3,4,9,16,39",
+        ]),
+        "storage_health": storage_health(),
+        "bmc_sensors": run_command(["ipmitool", "sdr", "elist"]),
+        "bmc_event_log": run_command(["ipmitool", "sel", "elist"]),
+        "edac": {str(path): read(path) for pattern in ("mc*/ce_count", "mc*/ue_count")
+                 for path in Path("/sys/devices/system/edac/mc").glob(pattern)},
         "memory_channels": "UNKNOWN: use vendor channel mapping for DIMM locators; DIMM count is not channel count.",
         "platform": run_command(["uname", "-srmo"])["output"].strip(),
     }
+    if not include_serials:
+        def redact(value):
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()
+                        if key.lower() not in ("serial", "serial_number", "wwn")}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            if isinstance(value, str):
+                value = re.sub(r"(?im)^.*Serial Number\s*:.*$", "Serial Number: omitted", value)
+                value = re.sub(r"<serial>.*?</serial>", "<serial>omitted</serial>", value)
+                value = re.sub(r'("serial_number"\s*:\s*)"[^"]*"', r'\1"omitted"', value)
+            return value
+        result = redact(result)
+    return result
+
+
+def storage_health():
+    listing = run_command(["lsblk", "-J", "-d", "-o", "PATH,TYPE"])
+    try:
+        devices = json.loads(listing["output"])["blockdevices"]
+    except (ValueError, KeyError):
+        return {"discovery": listing}
+    return {
+        device["path"]: run_command(["smartctl", "-a", "-j", device["path"]])
+        for device in devices if device.get("type") == "disk"
+    }
+
+
+def component_tables(inv):
+    def table(title, columns, rows):
+        heading = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
+        body = "".join("<tr>" + "".join(
+            f"<td>{html.escape('—' if value is None else str(value))}</td>"
+            for value in row
+        ) + "</tr>" for row in rows)
+        return f"<h2>{title}</h2><div class='table'><table><tr>{heading}</tr>{body}</table></div>"
+
+    result = table("GPU components", ["GPU", "Model", "VRAM MiB", "Board", "Serial", "PCI bus"], [
+        [gpu.get("index"), gpu.get("name"), gpu.get("memory.total"),
+         gpu.get("details", {}).get("form_factor"), gpu.get("details", {}).get("serial"),
+         gpu.get("pci.bus_id")] for gpu in inv.get("gpus", [])
+    ])
+    result += table("Memory modules", ["Slot", "Bank", "Size", "Manufacturer", "Part", "Speed", "Serial"], [
+        [dimm.get(key) for key in ("locator", "bank", "size", "manufacturer",
+                                  "part_number", "configured_speed", "serial")]
+        for dimm in inv.get("dimms", [])
+    ])
+    result += table("Storage components", ["Device", "Model", "Size", "Transport", "Serial"], [
+        [device.get(key) for key in ("name", "model", "size", "tran", "serial")]
+        for device in inv.get("disks", {}).get("blockdevices", [])
+        if device.get("type") == "disk"
+    ])
+    return result
 
 
 class Report:
@@ -169,7 +260,10 @@ class Report:
                 "Unspecified acceptance thresholds remain UNKNOWN.",
                 "DIMM population is not measured memory channel count.",
                 "PCIe link speed is sampled after transfer; idle power management may lower it.",
-                "GPU GFLOPS from gpu-burn are FP32 workload metrics, not tensor/AI throughput.",
+                "GPU FP32/FP64 workload metrics are not tensor/AI throughput.",
+                "ECC locations depend on hardware. Compute correctness is tested separately.",
+                "VRAM tests cover allocated memory; driver-reserved memory is inaccessible.",
+                "Optional sensors or hidden components remain unavailable, not inferred.",
             ],
         }
 
@@ -248,18 +342,22 @@ main{{max-width:1200px;margin:auto}}h1{{font-size:40px}}a{{color:#75d9ff}}
 .card strong{{font-size:38px}}table{{width:100%;border-collapse:collapse;font-size:14px}}
 td,th{{padding:12px;text-align:left;border-bottom:1px solid #354462}}.table{{overflow-x:auto}}
 footer{{margin-top:32px;color:#aab9d3}}code{{color:#75d9ff}}
+pre{{white-space:pre-wrap;overflow-wrap:anywhere}}
 </style><main><p>winintel AI · Ubuntu Hardware Acceptance</p><h1>Your server. Measured.</h1>
 <p class="score">{overall}</p>
 <p>{html.escape(self.data['profile'].get('name', 'Custom profile'))}</p>
 <p>{html.escape(self.data['created_utc'])}</p>
 <div class="cards">{''.join(f'<div class="card"><strong>{count}</strong><p>{key}</p></div>' for key, count in self.data['counts'].items())}</div>
+{component_tables(self.data['inventory'])}
 <h2>Acceptance checks</h2><div class="table"><table><tr><th>Check</th><th>Result</th><th>Measured</th><th>Target</th><th>Evidence</th></tr>
 {''.join(rows)}</table></div><h2>Measurements &amp; topology</h2>
-<details><summary>Hardware inventory (serial numbers omitted)</summary><pre>{html.escape(json.dumps(self.data['inventory'], indent=2, ensure_ascii=False))}</pre></details>
+<details open><summary>Hardware components and topology</summary><pre>{html.escape(json.dumps(self.data['inventory'], indent=2, ensure_ascii=False))}</pre></details>
 <h2>Evidence logs</h2><ul>{tools}</ul><h2>How to read this report</h2><ul>{limits}</ul>
 <p><a href="report.json">Download JSON for your AI Agent</a> · <a href="report.md">Markdown report</a></p>
 <footer>数萌AI服务器 (winintel) · <a href="https://winintel.com">winintel.com</a></footer></main></html>"""
         (self.output / "report.html").write_text(document, encoding="utf-8")
+        md.extend(["", "## Hardware components and topology", "", "```json",
+                   json.dumps(self.data["inventory"], indent=2, ensure_ascii=False), "```"])
         (self.output / "report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
         return {"PASS": 0, "FAIL": 2, "INCOMPLETE": 3}[overall]
 
@@ -301,6 +399,28 @@ def check_inventory(report, inv):
         "UNKNOWN" if query_code in (124, 127) else "PASS" if query_code == 0 else "FAIL",
         query_code, 0, "Evidence: JSON inventory.gpu_query",
     )
+    for category in ("pcie_all_devices", "network", "usb", "system_board_bios_cpu_psu",
+                     "bmc_sensors", "bmc_event_log"):
+        if category in inv:
+            result = inv[category]
+            report.check(f"Inventory {category}", "PASS" if result["returncode"] == 0 else "UNKNOWN",
+                         result["returncode"], 0, "Collection result; unavailable/hidden components need vendor or BMC access")
+    for device, result in inv.get("storage_health", {}).items():
+        if device == "discovery":
+            report.check("Storage health discovery", "UNKNOWN", detail=result["output"])
+            continue
+        status = "UNKNOWN"
+        if result["returncode"] not in (124, 127):
+            if result["returncode"] & 0b11111000:
+                status = "FAIL"
+            else:
+                try:
+                    passed = json.loads(result["output"]).get("smart_status", {}).get("passed")
+                    status = "PASS" if passed is True and result["returncode"] == 0 else "FAIL" if passed is False else "UNKNOWN"
+                except ValueError:
+                    pass
+        report.check(f"Disk {device} SMART health", status, result["returncode"], 0,
+                     "Health snapshot; a storage speed test does not prove remaining lifetime")
     for gpu in gpus:
         name = f"GPU {gpu['index']}"
         target = profile.get("gpu_name_contains")
@@ -321,6 +441,12 @@ def check_inventory(report, inv):
         )
         ecc = number(gpu["ecc.errors.uncorrected.volatile.total"])
         report.check(name + " uncorrectable volatile ECC", "UNKNOWN" if ecc is None else "PASS" if ecc == 0 else "FAIL", ecc, 0)
+        for key, raw in gpu.get("details", {}).get("error_counters", {}).items():
+            value = number(raw)
+            if value is not None:
+                report.check(name + " initial " + key, "PASS" if value == 0 else "FAIL", value, 0)
+            elif raw in ("Yes", "Pending", "Failure"):
+                report.check(name + " " + key, "FAIL", raw, "No")
 
 
 def bandwidth_value(text, label):
@@ -362,11 +488,30 @@ def gpu_tests(report, args):
         report.minimum(f"GPU {index} PCIe speed (GT/s)", speed, "gpu_pcie_speed_gt_min", "Idle downshift possible; confirm under sustained traffic if this fails.")
     if len(gpus) > 1:
         peer = report.command("gpu-p2p", [ROOT / "bin/p2pBandwidthLatencyTest"], timeout=180)
-        report.tool_check("gpu-p2p", peer, "P2P=Enabled Latency" in peer["output"])
-    before = report.command("gpu-ecc-before", [
-        "nvidia-smi", "--query-gpu=index,ecc.errors.uncorrected.volatile.total",
-        "--format=csv,noheader,nounits",
-    ])
+        parsed = matrices(peer["output"])
+        bandwidth = parsed.get("Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)", {})
+        connectivity = parsed.get("P2P Connectivity Matrix", {})
+        report.tool_check("gpu-p2p", peer, bool(bandwidth) and bool(connectivity))
+        report.data["p2p_matrices"] = parsed
+        pairs = nvlink_pairs(report.data["inventory"].get("gpu_topology", {}).get("output", ""))
+        report.data["nvlink_pairs"] = pairs
+        for left, right in pairs:
+            for source, target in ((left, right), (right, left)):
+                connected = connectivity.get(source, {}).get(target) == 1
+                value = bandwidth.get(source, {}).get(target) if connected else None
+                report.minimum(f"NVLink GPU {source} to {target} (GB/s)", value, "gpu_nvlink_gb_s_min",
+                               "CUDA P2P writes on an NVLink-connected pair; achieved bandwidth, not physical per-link rate")
+        if not pairs:
+            if report.data["inventory"].get("gpu_topology", {}).get("returncode") == 0:
+                report.data["nvlink_test"] = "NOT_APPLICABLE: no NVLink-connected GPU pairs"
+            else:
+                report.check("NVLink bandwidth", "UNKNOWN", detail="Topology unavailable; cannot decide whether NVLink exists")
+    else:
+        report.data["nvlink_pairs"] = []
+        report.data["nvlink_test"] = "NOT_APPLICABLE: one GPU; no GPU-to-GPU pair"
+    before = report.command("gpu-ecc-before", ["nvidia-smi", "-q", "-x"])
+    before_details = gpu_details(before["output"])
+    nvlink_before = report.command("nvlink-errors-before", ["nvidia-smi", "nvlink", "-e"])
     telemetry_path = report.output / "logs/gpu-telemetry.csv"
     with telemetry_path.open("w", encoding="utf-8") as handle:
         monitor = subprocess.Popen([
@@ -375,10 +520,45 @@ def gpu_tests(report, args):
             "--format=csv,nounits", "--loop=1",
         ], stdout=handle, stderr=subprocess.DEVNULL, start_new_session=True)
         try:
-            burn = report.command(
-                "gpu-burn", [ROOT / "vendor/gpu-burn/gpu_burn", str(args.seconds)],
-                timeout=args.seconds + 90, cwd=ROOT / "vendor/gpu-burn",
-            )
+            for precision, options in (("fp32", []), ("fp64", ["-d"])):
+                burn = report.command(
+                    f"gpu-burn-{precision}",
+                    [ROOT / "vendor/gpu-burn/gpu_burn", *options, str(args.seconds)],
+                    timeout=args.seconds + 90, cwd=ROOT / "vendor/gpu-burn",
+                )
+                burn_checks(report, gpus, burn, args.seconds, precision)
+            for gpu in gpus:
+                index = gpu["index"]
+                memory = report.command(
+                    f"gpu-{index}-vram",
+                    [ROOT / "bin/cuda_memtest", "--device", index, "--num_passes",
+                     str(getattr(args, "vram_passes", 1)), "--num_iterations", "100",
+                     "--exit_on_error", "--enable_test", "9"]
+                    if getattr(args, "bit_fade", False) else
+                    [ROOT / "bin/cuda_memtest", "--device", index, "--num_passes",
+                     str(getattr(args, "vram_passes", 1)), "--num_iterations", "100",
+                     "--exit_on_error"],
+                    timeout=getattr(args, "vram_timeout", 1800),
+                )
+                required = list(range(11)) if getattr(args, "bit_fade", False) else [*range(9), 10]
+                finished = all(len(re.findall(rf"\bTest{test} finished\b", memory["output"])) >= getattr(args, "vram_passes", 1) for test in required)
+                report.tool_check(f"gpu-{index}-vram", memory, finished and "Program exits" in memory["output"])
+                allocated = re.search(r"Allocated (\d+) MB", memory["output"])
+                capacity = number(gpu.get("memory.total"))
+                coverage = round(int(allocated[1]) / capacity * 100, 2) if allocated and capacity else None
+                gpu["vram_test_allocated_mib"] = int(allocated[1]) if allocated else None
+                report.minimum(f"GPU {index} VRAM tested coverage (%)", coverage, "gpu_vram_coverage_pct_min")
+                reference = report.command(
+                    f"gpu-{index}-matrix-reference",
+                    [ROOT / "bin/matrixMul", f"--device={index}"], timeout=120,
+                )
+                report.tool_check(f"gpu-{index}-matrix-reference", reference, "Result = PASS" in reference["output"])
+                lu = report.command(
+                    f"gpu-{index}-fp64-lu-reference",
+                    [ROOT / "bin/simpleCUBLAS_LU", f"--device={index}"], timeout=120,
+                )
+                report.tool_check(f"gpu-{index}-fp64-lu-reference", lu,
+                                  "TEST SUCCESSFUL" in lu["output"] and "ERROR:" not in lu["output"])
         finally:
             monitor.terminate()
             try:
@@ -387,23 +567,52 @@ def gpu_tests(report, args):
                 monitor.kill()
                 monitor.wait()
     report.data["gpu_telemetry_log"] = "logs/gpu-telemetry.csv"
-    # gpu-burn may exit zero even if individual GPUs report faulty results.
+    after = report.command("gpu-ecc-after", ["nvidia-smi", "-q", "-x"])
+    after_details = gpu_details(after["output"])
+    report.data["ecc_changes"] = counter_changes(before_details, after_details)
+    for gpu in gpus:
+        details = after_details.get(gpu["index"], {})
+        enabled = details.get("ecc_mode")
+        report.check(f"GPU {gpu['index']} ECC enabled", "PASS" if enabled == "Enabled" else "UNKNOWN",
+                     enabled, "Enabled", "Unsupported ECC is not an ECC pass")
+        changes = [item for item in report.data["ecc_changes"] if item["gpu"] == gpu["index"]]
+        if not changes:
+            report.check(f"GPU {gpu['index']} ECC counters", "UNKNOWN", detail="No numeric ECC/retirement counters available")
+        for change in changes:
+            key, value, delta = change["counter"], change["after"], change["delta"]
+            absolute_bad = value > 0 and (
+                "uncorrected" in key or "uncorrectable" in key
+                or "/double_bit/" in key or key.startswith("retired_pages/")
+                or key.startswith("remapped_rows/")
+            )
+            status = "FAIL" if absolute_bad or (delta is not None and delta > 0) else "UNKNOWN" if delta is None or delta < 0 else "PASS"
+            report.check(f"GPU {gpu['index']} {key}", status, value, change["before"],
+                         f"Delta={delta}; positive corrected or uncorrected increments fail acceptance; resets are UNKNOWN")
+    for kind in ("-s", "-e"):
+        result = report.command(f"nvlink-after{kind}", ["nvidia-smi", "nvlink", kind])
+        report.data[f"nvlink_after{kind}"] = result["output"]
+        if kind == "-e" and report.data.get("nvlink_pairs"):
+            earlier = nvlink_counters(nvlink_before["output"])
+            later = nvlink_counters(result["output"])
+            if not later:
+                report.check("NVLink error counters", "UNKNOWN", detail="No readable link-error counters")
+            for key, value in later.items():
+                old = earlier.get(key)
+                delta = value - old if old is not None else None
+                status = "FAIL" if value > 0 else "UNKNOWN" if delta is None or delta < 0 else "PASS"
+                report.check(f"NVLink {key}", status, value, old, f"Delta={delta}")
+
+
+def burn_checks(report, gpus, burn, seconds, precision):
+    """A zero tool exit alone does not prove every GPU computed correctly."""
     for gpu in gpus:
         index = gpu["index"]
         ok = re.search(rf"GPU\s+{re.escape(index)}:\s+OK\b", burn["output"]) is not None
         bad = re.search(rf"GPU\s+{re.escape(index)}:\s+(?:FAULTY|FAILED|FAIL)\b", burn["output"]) is not None
-        completed = burn["seconds"] >= args.seconds * 0.8
-        status = "UNKNOWN" if burn["returncode"] in (124, 127) else "FAIL" if bad or burn["returncode"] else "PASS" if ok and completed else "UNKNOWN"
-        report.check(f"GPU {index} stress correctness", status, detail="gpu-burn compares computed results; see logs/gpu-burn.log")
-    after = report.command("gpu-ecc-after", [
-        "nvidia-smi", "--query-gpu=index,ecc.errors.uncorrected.volatile.total",
-        "--format=csv,noheader,nounits",
-    ])
-    report.data["ecc_snapshots"] = {"before": before["output"], "after": after["output"]}
-    ecc_rows = list(csv.reader(after["output"].splitlines(), skipinitialspace=True)) if after["returncode"] == 0 else []
-    for gpu in gpus:
-        value = next((number(row[1]) for row in ecc_rows if len(row) == 2 and row[0] == gpu["index"]), None)
-        report.check(f"GPU {gpu['index']} ECC after stress", "UNKNOWN" if value is None else "PASS" if value == 0 else "FAIL", value, 0)
+        completed = burn["seconds"] >= seconds * 0.8
+        status = "FAIL" if bad else "UNKNOWN" if burn["returncode"] in (124, 127) else "FAIL" if burn["returncode"] else "PASS" if ok and completed else "UNKNOWN"
+        report.check(f"GPU {index} {precision.upper()} stress correctness", status,
+                     detail=f"Computed-result comparisons; logs/gpu-burn-{precision}.log")
 
 
 def cpu_ram_tests(report, args):
@@ -521,11 +730,19 @@ def main():
     parser.add_argument("--skip-cpu-ram", action="store_true")
     parser.add_argument("--skip-disk", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--include-serials", action="store_true", help="Include private component serial numbers")
+    parser.add_argument("--vram-passes", type=int, default=1, help="VRAM pattern passes; use 32 for complete test6 pattern rotation")
+    parser.add_argument("--vram-timeout", type=int, default=1800, help="Per GPU memory test timeout")
+    parser.add_argument("--bit-fade", action="store_true", help="Add 3-hour VRAM retention test per pass; increase timeout")
     args = parser.parse_args()
     if args.action == "test" and not args.skip_gpu and os.environ.get("CUDA_VISIBLE_DEVICES"):
         parser.error("Unset CUDA_VISIBLE_DEVICES so GPU indices match nvidia-smi")
     if not 10 <= args.seconds <= 86400 or not 1 <= args.disk_size_gib <= 1024:
         parser.error("seconds must be 10..86400; disk size 1..1024 GiB")
+    if not 1 <= args.vram_passes <= 1000 or not 60 <= args.vram_timeout <= 604800:
+        parser.error("vram passes must be 1..1000; timeout 60..604800")
+    if args.bit_fade and args.vram_timeout < 10800 * args.vram_passes + 1800:
+        parser.error("Bit fade needs --vram-timeout >= 10800 * passes + 1800 seconds")
     try:
         profile = load_profile(args.profile)
     except (OSError, ValueError, re.error) as exc:
@@ -535,8 +752,13 @@ def main():
             "action": args.action, "profile": profile, "seconds_per_test": args.seconds,
             "disk_path": args.disk_path, "disk_size_gib": args.disk_size_gib,
             "skip_gpu": args.skip_gpu, "skip_cpu_ram": args.skip_cpu_ram,
-            "skip_disk": args.skip_disk, "estimated_seconds_excluding_install": args.seconds * 8 + 600,
+            "skip_disk": args.skip_disk,
+            "estimated_seconds_excluding_install_and_vram": args.seconds * 9 + 600,
+            "vram_budget": "Detected GPU count × per-GPU VRAM timeout; actual duration varies with capacity and passes",
             "writes": "Unique fio scratch file only; cleaned up afterward",
+            "gpu_workloads": ["FP32 burn", "FP64 burn", "VRAM patterns", "matrix reference", "PCIe", "NVLink/P2P"],
+            "vram_passes": args.vram_passes, "bit_fade": args.bit_fade,
+            "vram_timeout_per_gpu": args.vram_timeout,
         }, indent=2))
         return 0
     output = Path(args.output) if args.output else Path.cwd() / "reports" / dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -545,7 +767,7 @@ def main():
     (output / "logs").mkdir()
     report = Report(profile, output)
     try:
-        inv = inventory()
+        inv = inventory(args.include_serials)
         report.data["inventory"] = inv
         check_inventory(report, inv)
         if args.action == "test":
